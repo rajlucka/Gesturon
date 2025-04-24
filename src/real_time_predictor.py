@@ -1,328 +1,253 @@
-# continuous_recognition.py
+# real_time_predictor.py
+
 import cv2
 import numpy as np
 import mediapipe as mp
 from tensorflow.keras.models import load_model
 import pickle
+import pyttsx3
 from collections import deque
 
-def calculate_angle(p1, p2, p3):
-    """Calculate angle between three points in 3D space"""
-    v1 = p1 - p2
-    v2 = p3 - p2
+# Load model and label encoder
+try:
+    model = load_model('sign_model.h5')
+    with open('label_encoder.pkl', 'rb') as f:
+        label_encoder = pickle.load(f)
     
-    # Normalize vectors
-    v1_norm = np.linalg.norm(v1)
-    v2_norm = np.linalg.norm(v2)
-    
-    # Avoid division by zero
-    if v1_norm == 0 or v2_norm == 0:
-        return 0
-        
-    v1 = v1 / v1_norm
-    v2 = v2 / v2_norm
-    
-    # Calculate angle using dot product
-    dot_product = np.clip(np.dot(v1, v2), -1.0, 1.0)
-    angle = np.arccos(dot_product)
-    
-    return angle
+    # Automatically extract sequence length from model
+    SEQ_LENGTH = model.input_shape[1]
+    print(f"Model loaded successfully!")
+    print(f"Input shape: {model.input_shape}, Sequence length: {SEQ_LENGTH}")
+    print(f"Gestures: {label_encoder.classes_}")
+except Exception as e:
+    print(f"Error loading model: {e}")
+    exit(1)
 
-def extract_advanced_features(landmarks, landmarks_other=None, other_present=False):
-    """Extract advanced features from single frame landmarks"""
-    # Skip if all zeros (no hand detected frame)
-    if np.all(landmarks == 0):
-        return np.zeros(53 + (53 if other_present else 0) + (10 if other_present else 0))
+# Mediapipe setup
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+# Text-to-speech engine
+engine = pyttsx3.init()
+
+# Initialize sequence with model's sequence length
+sequence = deque(maxlen=SEQ_LENGTH)
+prediction_threshold = 0.6
+last_prediction = ''
+cooldown_counter = 0
+
+# Function for image enhancement
+def enhance_image(image):
+    # Convert to YUV color space
+    yuv = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
     
-    # 1. Calculate finger angles
-    # Thumb angle
-    thumb_angle = calculate_angle(landmarks[1], landmarks[2], landmarks[3])
-    # Index finger angle
-    index_angle = calculate_angle(landmarks[5], landmarks[6], landmarks[7])
-    # Middle finger angle
-    middle_angle = calculate_angle(landmarks[9], landmarks[10], landmarks[11])
-    # Ring finger angle
-    ring_angle = calculate_angle(landmarks[13], landmarks[14], landmarks[15])
-    # Pinky angle
-    pinky_angle = calculate_angle(landmarks[17], landmarks[18], landmarks[19])
+    # Apply histogram equalization to the Y channel
+    yuv[:,:,0] = cv2.equalizeHist(yuv[:,:,0])
     
-    angles = np.array([thumb_angle, index_angle, middle_angle, ring_angle, pinky_angle])
+    # Apply Contrast Limited Adaptive Histogram Equalization (CLAHE)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    yuv[:,:,0] = clahe.apply(yuv[:,:,0])
     
-    # 2. Calculate distances between fingertips and wrist
-    fingertip_indices = [4, 8, 12, 16, 20]  # Thumb, index, middle, ring, pinky tips
-    distances = np.array([np.linalg.norm(landmarks[idx] - landmarks[0]) for idx in fingertip_indices])
+    # Convert back to BGR
+    enhanced = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
     
-    # 3. Calculate fingertip to fingertip distances (10 pairs)
-    fingertip_distances = []
-    for i in range(len(fingertip_indices)):
-        for j in range(i+1, len(fingertip_indices)):
-            fingertip_distances.append(
-                np.linalg.norm(landmarks[fingertip_indices[i]] - landmarks[fingertip_indices[j]])
+    # Apply additional contrast enhancement
+    alpha = 1.3  # Contrast control (1.0 means no change)
+    beta = 10    # Brightness control (0 means no change)
+    enhanced = cv2.convertScaleAbs(enhanced, alpha=alpha, beta=beta)
+    
+    return enhanced
+
+# Prediction smoother class
+class GestureSmoother:
+    def __init__(self, num_classes, window_size=10, threshold=0.6):
+        self.window_size = window_size
+        self.threshold = threshold
+        self.history = []
+        self.num_classes = num_classes
+        
+    def update(self, prediction):
+        """Add new prediction to history"""
+        self.history.append(prediction)
+        if len(self.history) > self.window_size:
+            self.history.pop(0)
+    
+    def get_smoothed_prediction(self):
+        """Get smoothed prediction from history"""
+        if not self.history:
+            return None, 0
+        
+        # Average predictions over history
+        avg_prediction = np.mean(self.history, axis=0)
+        max_class = np.argmax(avg_prediction)
+        confidence = avg_prediction[max_class]
+        
+        if confidence > self.threshold:
+            return max_class, confidence
+        return None, confidence
+
+# Initialize the smoother
+smoother = GestureSmoother(len(label_encoder.classes_), window_size=8, threshold=prediction_threshold)
+
+# Webcam setup
+cap = cv2.VideoCapture(0)
+
+# Create a named window for trackbar controls
+cv2.namedWindow('ASL Recognition')
+
+# Create trackbars for adjustment
+cv2.createTrackbar('Contrast', 'ASL Recognition', 130, 300, lambda x: x)
+cv2.createTrackbar('Brightness', 'ASL Recognition', 10, 100, lambda x: x)
+cv2.createTrackbar('CLAHE Limit', 'ASL Recognition', 20, 50, lambda x: x)
+
+with mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7
+) as hands:
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        frame = cv2.flip(frame, 1)
+        
+        # Get current trackbar values
+        alpha = cv2.getTrackbarPos('Contrast', 'ASL Recognition') / 100.0
+        beta = cv2.getTrackbarPos('Brightness', 'ASL Recognition')
+        clip_limit = cv2.getTrackbarPos('CLAHE Limit', 'ASL Recognition') / 10.0
+        
+        # Apply custom image enhancement with trackbar values
+        yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV)
+        yuv[:,:,0] = cv2.equalizeHist(yuv[:,:,0])
+        
+        # Apply CLAHE with adjustable clip limit
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8,8))
+        yuv[:,:,0] = clahe.apply(yuv[:,:,0])
+        
+        # Convert back to BGR
+        enhanced_frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+        
+        # Apply contrast and brightness adjustment
+        enhanced_frame = cv2.convertScaleAbs(enhanced_frame, alpha=alpha, beta=beta)
+        
+        # Create side-by-side view
+        viz_frame = enhanced_frame.copy()
+        
+        # Calculate image quality metrics
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        enhanced_gray = cv2.cvtColor(enhanced_frame, cv2.COLOR_BGR2GRAY)
+        
+        # Calculate brightness and contrast
+        orig_brightness = np.mean(gray)
+        enhanced_brightness = np.mean(enhanced_gray)
+        
+        orig_contrast = np.std(gray)
+        enhanced_contrast = np.std(enhanced_gray)
+        
+        # Process the enhanced frame for hand detection
+        rgb_frame = cv2.cvtColor(enhanced_frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(rgb_frame)
+
+        # Default zeros if no hand detected
+        landmarks = np.zeros((21, 3))
+        hand_present = False
+
+        if results.multi_hand_landmarks:
+            hand_landmarks = results.multi_hand_landmarks[0]
+            mp_drawing.draw_landmarks(
+                viz_frame, hand_landmarks, mp_hands.HAND_CONNECTIONS
             )
-    
-    # 4. Hand shape features: convex hull area approximation
-    # Use fingertips and palm landmarks
-    key_points = np.array([landmarks[0], landmarks[4], landmarks[8], landmarks[12], landmarks[16], landmarks[20]])
-    # Approximate area using distances
-    shape_features = []
-    for i in range(len(key_points)):
-        for j in range(i+1, len(key_points)):
-            shape_features.append(np.linalg.norm(key_points[i] - key_points[j]))
-    
-    # Combine single hand features
-    single_hand_features = np.concatenate([angles, distances, fingertip_distances, shape_features])
-    
-    # If we have a second hand, compute inter-hand features
-    if other_present and landmarks_other is not None and not np.all(landmarks_other == 0):
-        # Extract features for other hand
-        other_hand_features = extract_advanced_features(landmarks_other)
-        
-        # Calculate distances between key points on both hands
-        inter_hand_features = []
-        for idx1 in fingertip_indices + [0]:  # Add wrist
-            for idx2 in fingertip_indices + [0]:  # Add wrist
-                # Only use a subset of combinations to avoid too many features
-                if idx1 == 0 or idx2 == 0 or (idx1 in [4, 8, 20] and idx2 in [4, 8, 20]):
-                    inter_hand_features.append(np.linalg.norm(landmarks[idx1] - landmarks_other[idx2]))
-        
-        # Return combined features
-        return np.concatenate([single_hand_features, other_hand_features, inter_hand_features])
-    
-    # Return single hand features only
-    return single_hand_features
+            landmarks = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark])
+            hand_present = True
 
-def preprocess_landmarks(landmarks, is_left_hand=False):
-    """Preprocess landmarks for better model performance"""
-    # Skip if all zeros (no hand detected frame)
-    if np.all(landmarks == 0):
-        return landmarks
-        
-    # 1. Normalize by wrist position
-    normalized = landmarks - landmarks[0]  # Subtract wrist position
-    
-    # 2. Scale normalization (make invariant to hand size)
-    # Find distance between wrist and middle finger MCP (landmark 9)
-    scale = np.linalg.norm(normalized[9])
-    if scale > 0:  # Avoid division by zero
-        normalized /= scale
-    
-    # 3. For left hand, mirror the x coordinates to standardize
-    if is_left_hand:
-        normalized[:, 0] = -normalized[:, 0]
-    
-    return normalized
+        # Normalize landmarks (wrist-based normalization)
+        landmarks = landmarks - landmarks[0]
 
-def run_continuous_recognition():
-    # Load model and encoder
-    try:
-        model = load_model('sign_model.h5')
-        with open('label_encoder.pkl', 'rb') as f:
-            label_encoder = pickle.load(f)
-        with open('pca_model.pkl', 'rb') as f:
-            pca = pickle.load(f)
-        print("Model and resources loaded successfully!")
-    except Exception as e:
-        print(f"Error loading model or resources: {e}")
-        print("Please make sure you've trained the model first.")
-        return
-        
-    # Setup MediaPipe
-    mp_hands = mp.solutions.hands
-    mp_drawing = mp.solutions.drawing_utils
-    mp_drawing_styles = mp.solutions.drawing_styles
+        # Add to sequence
+        sequence.append(landmarks.flatten())
 
-    # Constants
-    SEQUENCE_LENGTH = 40
-    sequence_left = deque(maxlen=SEQUENCE_LENGTH)
-    sequence_right = deque(maxlen=SEQUENCE_LENGTH)
-    sequence_presence = deque(maxlen=SEQUENCE_LENGTH)
-    sentence = []
-    predictions = deque(maxlen=10)
-    threshold = 0.7
-    cooldown = 0
-
-    # Webcam setup
-    cap = cv2.VideoCapture(0)
-    
-    # Initialization period to prevent false "no" detections
-    initialization_frames = 30
-    frame_count = 0
-    initialized = False
-
-    with mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=2,  # Track two hands
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.7
-    ) as hands:
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                continue
-
-            frame = cv2.flip(frame, 1)
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = hands.process(rgb_frame)
-
-            # Initialize arrays for both hands
-            left_hand_landmarks = np.zeros((21, 3))
-            right_hand_landmarks = np.zeros((21, 3))
-            left_hand_present = False
-            right_hand_present = False
-
-            # Process hand landmarks if detected
-            if results.multi_hand_landmarks:
-                for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
-                    # Determine if this is a left or right hand
-                    hand_label = handedness.classification[0].label
-                    hand_color = (0, 255, 0) if hand_label == "Left" else (255, 0, 0)
+        # Check if we have enough frames
+        if len(sequence) == SEQ_LENGTH and hand_present:
+            try:
+                # Prepare input
+                input_data = np.expand_dims(np.array(sequence), axis=0)
+                
+                # Get prediction
+                prediction = model.predict(input_data)[0]
+                
+                # Update smoother
+                smoother.update(prediction)
+                smoothed_class, confidence = smoother.get_smoothed_prediction()
+                
+                if smoothed_class is not None:
+                    predicted_label = label_encoder.inverse_transform([smoothed_class])[0]
                     
-                    # Extract landmarks
-                    landmarks = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark])
+                    # Speak prediction (with cooldown)
+                    if predicted_label != last_prediction and cooldown_counter == 0 and predicted_label != 'neutral':
+                        last_prediction = predicted_label
+                        print(f"Prediction: {predicted_label} ({confidence:.2f})")
+                        engine.say(predicted_label)
+                        engine.runAndWait()
+                        cooldown_counter = 30
                     
-                    # Store in appropriate array
-                    if hand_label == "Left":
-                        left_hand_landmarks = preprocess_landmarks(landmarks, is_left_hand=True)
-                        left_hand_present = True
-                    else:  # Right hand
-                        right_hand_landmarks = preprocess_landmarks(landmarks, is_left_hand=False)
-                        right_hand_present = True
+                    if cooldown_counter > 0:
+                        cooldown_counter -= 1
                     
-                    # Draw landmarks with styled connections
-                    mp_drawing.draw_landmarks(
-                        frame,
-                        hand_landmarks,
-                        mp_hands.HAND_CONNECTIONS,
-                        mp_drawing_styles.get_default_hand_landmarks_style(),
-                        mp_drawing_styles.get_default_hand_connections_style()
-                    )
+                    # Display prediction
+                    display_text = f"{predicted_label} ({confidence:.2f})"
+                    cv2.putText(viz_frame, display_text, (10, 30), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                     
-                    # Add label for hand type
-                    wrist_x = int(hand_landmarks.landmark[0].x * frame.shape[1])
-                    wrist_y = int(hand_landmarks.landmark[0].y * frame.shape[0])
-                    cv2.putText(frame, hand_label, (wrist_x, wrist_y - 10), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, hand_color, 1, cv2.LINE_AA)
-                
-                # Update initialization counter
-                if not initialized:
-                    frame_count += 1
-                    if frame_count >= initialization_frames:
-                        initialized = True
-            
-            # Store presence as [left, right]
-            presence = np.array([1.0 if left_hand_present else 0.0, 1.0 if right_hand_present else 0.0])
-            
-            # Add to sequences
-            sequence_left.append(left_hand_landmarks.flatten())
-            sequence_right.append(right_hand_landmarks.flatten())
-            sequence_presence.append(presence)
-            
-            # Check if we have enough frames and initialization is complete
-            if len(sequence_left) == SEQUENCE_LENGTH and initialized:
-                # Extract features
-                sequence_features = []
-                for i in range(SEQUENCE_LENGTH):
-                    left = sequence_left[i].reshape(21, 3)
-                    right = sequence_right[i].reshape(21, 3)
-                    left_present = sequence_presence[i][0] > 0.5
-                    right_present = sequence_presence[i][1] > 0.5
-                    
-                    # Extract advanced features
-                    frame_features = extract_advanced_features(
-                        right, landmarks_other=left, other_present=left_present
-                    )
-                    sequence_features.append(frame_features)
-                
-                # Reshape and apply PCA
-                features_flat = np.array(sequence_features).reshape(1, -1)
-                features_pca = pca.transform(features_flat)
-                
-                # Prepare inputs
-                input_left = np.array(sequence_left).reshape(1, SEQUENCE_LENGTH, 63)
-                input_right = np.array(sequence_right).reshape(1, SEQUENCE_LENGTH, 63)
-                input_presence = np.array(sequence_presence).reshape(1, SEQUENCE_LENGTH, 2)
-                
-                # Predict
-                res = model.predict([input_left, input_right, input_presence, features_pca])[0]
-                predictions.append(np.argmax(res))
-                
-                # Get most common prediction
-                if len(predictions) == 10 and cooldown == 0:
-                    most_common = max(set(predictions), key=list(predictions).count)
-                    confidence = list(predictions).count(most_common) / 10
-                    
-                    if confidence > threshold:
-                        predicted_sign = label_encoder.inverse_transform([most_common])[0]
-                        
-                        # Only add to sentence if it's different from last prediction
-                        if predicted_sign != 'neutral':
-                            if len(sentence) == 0 or predicted_sign != sentence[-1]:
-                                sentence.append(predicted_sign)
-                                if len(sentence) > 5:  # Keep last 5 words
-                                    sentence = sentence[-5:]
-                                cooldown = 20  # Set cooldown to avoid rapid predictions
-            
-            if cooldown > 0:
-                cooldown -= 1
-            
-            # Display sentence with nicer styling
-            sentence_text = ' '.join(sentence)
-            # Add a semi-transparent background for better readability
-            overlay = frame.copy()
-            cv2.rectangle(overlay, (10, 10), (frame.shape[1]-10, 60), (0, 0, 0), -1)
-            cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-            cv2.putText(frame, sentence_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-            
-            # Display current sign
-            if (left_hand_present or right_hand_present) and len(predictions) == 10 and initialized:
-                most_common = max(set(predictions), key=list(predictions).count)
-                confidence = list(predictions).count(most_common) / 10
-                current_sign = label_encoder.inverse_transform([most_common])[0]
-                
-                # Add a semi-transparent background
-                overlay = frame.copy()
-                cv2.rectangle(overlay, (10, frame.shape[0]-80), (300, frame.shape[0]-10), (0, 0, 0), -1)
-                cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-                
-                color = (0, 255, 0) if confidence > threshold else (0, 165, 255)
-                cv2.putText(frame, f"Current: {current_sign}", (20, frame.shape[0]-50), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
-                
-                # Add confidence bar
-                bar_length = int(confidence * 200)
-                cv2.rectangle(frame, (150, frame.shape[0]-30), (150 + bar_length, frame.shape[0]-20), color, -1)
-                cv2.rectangle(frame, (150, frame.shape[0]-30), (350, frame.shape[0]-20), (255, 255, 255), 1)
-                
-                # Hand presence indicators
-                left_color = (0, 255, 0) if left_hand_present else (50, 50, 50)
-                right_color = (255, 0, 0) if right_hand_present else (50, 50, 50)
-                cv2.circle(frame, (30, frame.shape[0]-50), 8, left_color, -1)
-                cv2.circle(frame, (100, frame.shape[0]-50), 8, right_color, -1)
-            else:
-                # Show initialization status
-                if not initialized:
-                    status = f"Initializing... {frame_count}/{initialization_frames}"
-                    cv2.putText(frame, status, (20, frame.shape[0]-30), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2, cv2.LINE_AA)
+                    # Show confidence bar
+                    bar_width = int(confidence * 200)
+                    cv2.rectangle(viz_frame, (10, 50), (10 + bar_width, 70), (0, 255, 0), -1)
+                    cv2.rectangle(viz_frame, (10, 50), (210, 70), (255, 255, 255), 2)
                 else:
-                    cv2.putText(frame, "Waiting for hand...", (20, frame.shape[0]-30), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
-            
-            # Instructions
-            cv2.putText(frame, "Press 'q' to quit, 'c' to clear sentence", 
-                        (10, frame.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-            
-            cv2.imshow('Continuous Sign Recognition', frame)
-            
-            key = cv2.waitKey(10) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('c'):
-                sentence = []  # Clear the sentence
+                    cv2.putText(viz_frame, "Low confidence", (10, 30), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+            except Exception as e:
+                print(f"Error during prediction: {e}")
+                cv2.putText(viz_frame, f"Error: {str(e)[:30]}", (10, 30), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        else:
+            # Show how many more frames we need
+            frames_needed = SEQ_LENGTH - len(sequence)
+            if frames_needed > 0:
+                message = f"Collecting frames: {len(sequence)}/{SEQ_LENGTH}"
+                cv2.putText(viz_frame, message, (10, 30), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                
+                # Show progress bar
+                progress = int((len(sequence) / SEQ_LENGTH) * 200)
+                cv2.rectangle(viz_frame, (10, 50), (10 + progress, 70), (0, 0, 255), -1)
+                cv2.rectangle(viz_frame, (10, 50), (210, 70), (255, 255, 255), 2)
+            else:
+                cv2.putText(viz_frame, "No hand detected", (10, 30), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-    cap.release()
-    cv2.destroyAllWindows()
+        # Display image enhancement metrics
+        cv2.putText(viz_frame, f"Original Brightness: {orig_brightness:.1f}", (10, viz_frame.shape[0] - 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(viz_frame, f"Enhanced Brightness: {enhanced_brightness:.1f}", (10, viz_frame.shape[0] - 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(viz_frame, f"Original Contrast: {orig_contrast:.1f}", (10, viz_frame.shape[0] - 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(viz_frame, f"Enhanced Contrast: {enhanced_contrast:.1f}", (10, viz_frame.shape[0] - 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-if __name__ == "__main__":
-    run_continuous_recognition()
+        # Show quit instructions
+        cv2.putText(viz_frame, "Press 'q' to quit", (viz_frame.shape[1] - 150, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Display frame
+        cv2.imshow('ASL Recognition', viz_frame)
+        
+        # Check for quit
+        if cv2.waitKey(10) & 0xFF == ord('q'):
+            break
+
+cap.release()
+cv2.destroyAllWindows()

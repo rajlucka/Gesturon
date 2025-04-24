@@ -8,44 +8,43 @@ from pathlib import Path
 
 # CONFIGURATION
 DATA_PATH = os.path.join('data')  # Parent data folder
-GESTURES = ['hello', 'thanks', 'yes', 'no', 'neutral', 'my', 'name'] # You can add more
+GESTURES = ['hello', 'thanks', 'yes', 'no', 'neutral', 'sorry', 'where', 'i love you']
 NUM_NEW_SEQUENCES = 30  # Number of new sequences to add
-SEQUENCE_LENGTH = 40  # Number of frames per sequence
+SEQUENCE_LENGTH = 30  # Number of frames per sequence
 
-# Improved preprocessing function
-def preprocess_landmarks(landmarks, is_left_hand=False):
-    """Preprocess landmarks for better model performance"""
-    # Skip if all zeros (no hand detected frame)
-    if np.all(landmarks == 0):
-        return landmarks
-        
-    # 1. Normalize by wrist position
-    normalized = landmarks - landmarks[0]  # Subtract wrist position
+# Function for image enhancement
+def enhance_image(image):
+    # Convert to YUV color space
+    yuv = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
     
-    # 2. Scale normalization (make invariant to hand size)
-    # Find distance between wrist and middle finger MCP (landmark 9)
-    scale = np.linalg.norm(normalized[9])
-    if scale > 0:  # Avoid division by zero
-        normalized /= scale
+    # Apply histogram equalization to the Y channel
+    yuv[:,:,0] = cv2.equalizeHist(yuv[:,:,0])
     
-    # 3. For left hand, mirror the x coordinates to standardize
-    if is_left_hand:
-        normalized[:, 0] = -normalized[:, 0]
+    # Apply Contrast Limited Adaptive Histogram Equalization (CLAHE)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    yuv[:,:,0] = clahe.apply(yuv[:,:,0])
     
-    return normalized
+    # Convert back to BGR
+    enhanced = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+    
+    # Apply additional contrast enhancement
+    alpha = 1.3  # Contrast control (1.0 means no change)
+    beta = 10    # Brightness control (0 means no change)
+    enhanced = cv2.convertScaleAbs(enhanced, alpha=alpha, beta=beta)
+    
+    return enhanced
 
 # Initialize Mediapipe
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
 
 # Start capturing
 cap = cv2.VideoCapture(0)
 
-# Set up Mediapipe Hands for two hands
+# Set up Mediapipe Hands
 with mp_hands.Hands(
     static_image_mode=False,
-    max_num_hands=2,  # Track two hands
+    max_num_hands=1,
     min_detection_confidence=0.7,
     min_tracking_confidence=0.7
 ) as hands:
@@ -77,102 +76,66 @@ with mp_hands.Hands(
                 print(f"🔁 Skipping remaining sequences for gesture '{gesture}'.")
                 break
 
-            # Start recording immediately without countdown
             for frame_num in range(SEQUENCE_LENGTH):
                 ret, frame = cap.read()
                 if not ret:
                     continue
 
                 frame = cv2.flip(frame, 1)
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Apply image enhancement
+                enhanced_frame = enhance_image(frame)
+                
+                # Process the enhanced frame
+                rgb_frame = cv2.cvtColor(enhanced_frame, cv2.COLOR_BGR2RGB)
                 results = hands.process(rgb_frame)
 
-                # Initialize arrays for both hands
-                left_hand_landmarks = np.zeros((21, 3))
-                right_hand_landmarks = np.zeros((21, 3))
-                left_hand_present = False
-                right_hand_present = False
-
-                # Process hand landmarks if detected
+                # Draw landmarks
+                landmarks = np.zeros((21, 3))
                 if results.multi_hand_landmarks:
-                    # Create a copy of the frame for visualization
-                    vis_frame = frame.copy()
-                    
-                    for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
-                        # Determine if this is a left or right hand
-                        hand_label = handedness.classification[0].label
-                        hand_color = (0, 255, 0) if hand_label == "Left" else (255, 0, 0)
-                        
-                        # Extract landmarks
-                        landmarks = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark])
-                        
-                        # Store in appropriate array
-                        if hand_label == "Left":
-                            left_hand_landmarks = landmarks
-                            left_hand_present = True
-                        else:  # Right hand
-                            right_hand_landmarks = landmarks
-                            right_hand_present = True
-                        
-                        # Draw landmarks with styled connections on visualization frame
+                    for hand_landmarks in results.multi_hand_landmarks:
                         mp_drawing.draw_landmarks(
-                            vis_frame,
-                            hand_landmarks,
-                            mp_hands.HAND_CONNECTIONS,
-                            mp_drawing_styles.get_default_hand_landmarks_style(),
-                            mp_drawing_styles.get_default_hand_connections_style()
+                            enhanced_frame, hand_landmarks, mp_hands.HAND_CONNECTIONS
                         )
-                        
-                        # Add label for hand type
-                        wrist_x = int(hand_landmarks.landmark[0].x * frame.shape[1])
-                        wrist_y = int(hand_landmarks.landmark[0].y * frame.shape[0])
-                        cv2.putText(vis_frame, hand_label, (wrist_x, wrist_y - 10), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, hand_color, 1, cv2.LINE_AA)
-                    
-                    # Use the visualization frame for display
-                    frame = vis_frame
-
-                # Apply preprocessing to landmarks
-                processed_left = preprocess_landmarks(left_hand_landmarks, is_left_hand=True)
-                processed_right = preprocess_landmarks(right_hand_landmarks, is_left_hand=False)
-                
-                # Combine both hands' landmarks and handedness flags
-                combined_data = {
-                    'left_hand': processed_left,
-                    'right_hand': processed_right,
-                    'left_present': left_hand_present,
-                    'right_present': right_hand_present
-                }
+                    landmarks = np.array([[lm.x, lm.y, lm.z] for lm in results.multi_hand_landmarks[0].landmark])
 
                 # Save landmarks
                 dirpath = os.path.join(DATA_PATH, gesture, str(sequence))
                 Path(dirpath).mkdir(parents=True, exist_ok=True)
-                np.save(os.path.join(dirpath, f'{frame_num}.npy'), combined_data)
+                np.save(os.path.join(dirpath, f'{frame_num}.npy'), landmarks)
 
-                # Enhance overlay info with progress bars
-                # Background rectangle for better visibility
-                overlay = frame.copy()
-                cv2.rectangle(overlay, (0, 0), (frame.shape[1], 60), (0, 0, 0), -1)
-                cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+                # Overlay info on enhanced frame
+                overlay = enhanced_frame.copy()
+                cv2.rectangle(overlay, (0, 0), (enhanced_frame.shape[1], 60), (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.7, enhanced_frame, 0.3, 0, enhanced_frame)
                 
-                # Text info
-                cv2.putText(frame, f'{gesture.upper()} | Seq: {sequence} | Frame: {frame_num}', (10, 30),
+                cv2.putText(enhanced_frame, f'{gesture.upper()} | Seq: {sequence} | Frame: {frame_num}', (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
                 
                 # Progress bar for frame sequence
                 progress = int((frame_num / SEQUENCE_LENGTH) * 200)
-                cv2.rectangle(frame, (10, 40), (10 + progress, 50), (0, 255, 0), -1)
-                cv2.rectangle(frame, (10, 40), (210, 50), (255, 255, 255), 1)
+                cv2.rectangle(enhanced_frame, (10, 40), (10 + progress, 50), (0, 255, 0), -1)
+                cv2.rectangle(enhanced_frame, (10, 40), (210, 50), (255, 255, 255), 1)
                 
-                # Hand presence indicators
-                left_color = (0, 255, 0) if left_hand_present else (50, 50, 50)
-                right_color = (0, 0, 255) if right_hand_present else (50, 50, 50)
-                cv2.putText(frame, "L", (230, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, left_color, 2)
-                cv2.putText(frame, "R", (250, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, right_color, 2)
+                # Show lighting quality indicator
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                avg_brightness = np.mean(gray)
+                std_brightness = np.std(gray)
                 
-                cv2.imshow('Collecting Landmarks', frame)
+                lighting_quality = "Good"
+                lighting_color = (0, 255, 0)
+                if avg_brightness < 80 or avg_brightness > 200:
+                    lighting_quality = "Poor"
+                    lighting_color = (0, 0, 255)
+                elif std_brightness < 40:
+                    lighting_quality = "Fair"
+                    lighting_color = (0, 255, 255)
+                
+                cv2.putText(enhanced_frame, f"Lighting: {lighting_quality}", (10, 80), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, lighting_color, 2)
+                
+                cv2.imshow('Collecting Landmarks', enhanced_frame)
 
-                # Check for early exit
                 if cv2.waitKey(10) & 0xFF == ord('q'):
                     break
 
